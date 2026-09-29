@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Compile Python source
+        run: python3 -m compileall -q python tests examples
       - name: Rebuild benchmark figures from checked-in data
         run: |
           python3 scripts/make_charts.py benchmarks/decode_results.csv
@@ -26,8 +28,21 @@ jobs:
           from html.parser import HTMLParser
           from pathlib import Path
           from xml.etree import ElementTree
-          HTMLParser().feed(Path('docs/index.html').read_text(encoding='utf-8'))
+          for path in Path('docs').glob('*.html'):
+              HTMLParser().feed(path.read_text(encoding='utf-8'))
           for path in Path('assets').glob('*.svg'):
               ElementTree.parse(path)
           print('HTML and SVG parse checks passed')
+          PY
+      - name: Validate checked-in model parity artifact
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          run = json.loads(Path('benchmarks/vllm_parity.json').read_text())
+          assert run['backends']['TRITON_ATTN'] == run['backends']['CUSTOM']
+          assert run['exact_token_parity'] and run['custom_fast_path_observed']
+          assert run['prefill_fallback_observed']
+          assert len(run['prompts']) == len(run['backends']['CUSTOM']) == 3
+          print('Model parity artifact is internally consistent')
           PY

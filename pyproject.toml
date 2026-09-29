@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "torch>=2.8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "branchcraft-cuda"
+version = "0.2.0"
+description = "CUDA tree verification and a vLLM V1 paged decode backend"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.8"]
+license = {file = "LICENSE"}
+
+[project.optional-dependencies]
+vllm = ["vllm==0.27.0"]
+test = ["pytest>=8"]
+
+[project.entry-points."vllm.general_plugins"]
+branchcraft = "branchcraft_vllm.plugin:register"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]

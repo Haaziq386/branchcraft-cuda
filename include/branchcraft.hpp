@@ -64,4 +64,13 @@ cudaError_t commit_path(Shape shape, const half* draft_k, const half* draft_v,
                         int request, int nodes, int accepted,
                         cudaStream_t stream = nullptr);
 
+// vLLM-style packed cache. Logical shape [P,Hkv,16,2D], with runtime strides
+// so either NHD or HND physical layout works without a KV copy. Q and output
+// are contiguous [B,Hq,D]. Output is FP16, accumulation stays FP32.
+cudaError_t packed_decode(Shape shape, const half* q, const half* packed_kv,
+                          const int* pages, const int* lengths, half* output,
+                          long long block_stride, long long head_stride,
+                          long long slot_stride, float scale,
+                          cudaStream_t stream = nullptr);
+
 }  // namespace branchcraft

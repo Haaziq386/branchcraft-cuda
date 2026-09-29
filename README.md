@@ -1,87 +1,90 @@
-# Branchcraft · speculative-tree attention in CUDA
+# Branchcraft · CUDA attention across the KV-cache boundary
 
-<p align="center"><img src="assets/hero.svg" alt="Branchcraft: shared paged prefix, draft token tree, CUDA verification, accepted-path commit" width="100%"></p>
+<p align="center"><img src="assets/hero.svg" alt="Shared paged prefix, draft tree verification, accepted-path commit" width="100%"></p>
 
-**A CUDA inference lab for the moment a draft tree meets the KV cache.** Branchcraft verifies every candidate node of a speculative tree in one GPU launch. Each node attends to a **shared paged prefix plus only its ancestors**. An accepted root-to-leaf path can then be copied into a fresh KV page, preserving sibling branches; rollback restores the prior page-table metadata.
+**A small inference systems lab with real framework entry points.** Branchcraft verifies a speculative draft tree against a shared paged prefix, commits only the accepted path through a copy-on-write KV transaction, exposes the CUDA kernels as PyTorch operators, and plugs a packed-KV decode path into vLLM V1.
 
-[Read the illustrated engineering article](https://haaziq386.github.io/branchcraft-cuda/) · [Tree kernel](src/tree_attention.cu) · [Raw tree results](benchmarks/tree_results.csv)
+[![CUDA compile and artifact checks](https://github.com/Haaziq386/branchcraft-cuda/actions/workflows/build.yml/badge.svg)](https://github.com/Haaziq386/branchcraft-cuda/actions/workflows/build.yml) · [Interactive tree article](https://haaziq386.github.io/branchcraft-cuda/docs/) · [Visual framework article](https://haaziq386.github.io/branchcraft-cuda/docs/framework.html) · [Integration contract](docs/framework-integration.md)
 
-![Measured tree attention latency](assets/tree-latency.svg)
+## Why this project exists
 
-## Why this is an inference-systems project
+A speculative candidate may attend to the prompt and **its own ancestors**, never a sibling. Multiple requests can share physical prefix pages; writing an accepted path into a shared partial page corrupts the other request. A serving backend adds another constraint: the scheduler owns the page table and may store logically identical K/V under different physical strides.
 
-The hard part is the contract between a scheduler's tree, the attention kernel, and a mutable KV cache. A normal sequence mask allows all earlier positions. A speculative **tree mask** allows exactly the prefix and the ancestors of one candidate; sibling tokens must stay invisible. After verification, only the accepted path should enter the durable cache. If several requests share the final prefix page, writing directly into that page corrupts the others. Branchcraft makes these invariants executable and tests them against a separate CPU oracle.
+Branchcraft makes these contracts visible and testable across three layers:
 
-This project combines established ideas from [SpecInfer](https://arxiv.org/abs/2305.09781), [DeFT](https://arxiv.org/abs/2404.00242), [PagedAttention](https://arxiv.org/abs/2309.06180), and [FlashInfer](https://arxiv.org/abs/2501.01005). It is an original, compact implementation and benchmark of a particular **tree-verification + shared-page transaction** boundary; it does not claim to invent tree attention or production speculative decoding.
+| Layer | What is implemented | Where to start |
+| --- | --- | --- |
+| CUDA | Ancestor-only online-softmax verifier, accepted-path copy, paged GQA decode, direct packed-KV decode | [`src/tree_attention.cu`](src/tree_attention.cu), [`src/packed_decode.cu`](src/packed_decode.cu) |
+| PyTorch | Dispatcher schemas, CUDA implementations, FakeTensor support, `torch.compile` tracing, CUDA graph-safe output, copy-on-write page transaction | [`bindings/torch_ops.cpp`](bindings/torch_ops.cpp), [`python/branchcraft_torch/transaction.py`](python/branchcraft_torch/transaction.py) |
+| vLLM V1 | Installed `CUSTOM` attention backend: guarded one-token FP16 decode from vLLM's packed cache, inherited Triton fallback for other calls | [`python/branchcraft_vllm/backend.py`](python/branchcraft_vllm/backend.py) |
 
-## Measured on RTX PRO 5000 Blackwell
+```mermaid
+flowchart LR
+  T[Draft tree + shared prefix] --> V[CUDA tree_verify]
+  V --> A[Choose accepted path]
+  A --> C[Copy-on-write page + CUDA commit_path_]
+  C --> K[Paged KV state]
+  S[vLLM scheduler metadata] --> G{Supported token decode?}
+  G -- yes --> D[CUDA packed_decode_out]
+  G -- no --> F[vLLM Triton fallback]
+  K -. same page-table invariant .-> S
+```
 
-Seven candidate nodes per request, 32 query heads, 8 KV heads, D=128, FP16 KV, page size 16. Both paths use one batched GPU launch and produce the same attention outputs. The expanded baseline physically duplicates each candidate's prefix and runs the project's paged decode kernel. `ratio = expanded_us / tree_us`, so below 1 means the tree path is slower.
+**Boundary:** the vLLM attention backend performs ordinary token decode. It does not receive draft-tree metadata and does not replace vLLM's speculative acceptance algorithm. The PyTorch path exposes tree verification and transaction semantics separately. This distinction is part of the design, not a hidden claim of full speculative serving integration.
 
-| Requests | Prefix | Tree latency | Expanded latency | Ratio | Live KV saved |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 2,048 | 714.1 µs | 675.9 µs | 0.95× | 85.8% |
-| 4 | 1,024 | 338.9 µs | 543.4 µs | 1.60× | 96.4% |
-| 8 | 2,048 | 725.2 µs | 1,121.4 µs | 1.55× | 98.2% |
+## Reproduce the CUDA work
 
-Numbers are CUDA-event medians from [the complete CSV](benchmarks/tree_results.csv). The memory metric counts live KV representation; it excludes fixture reserve capacity and allocator metadata. This is a comparison to an intentionally expanded representation, **not a vendor-kernel speedup claim**. The single-request long-prefix regression matters: the parent walk and shared layout do not automatically make the kernel faster.
-
-![Live KV memory](assets/tree-memory.svg)
-
-## Run it
-
-Requirements: NVIDIA GPU, CUDA Toolkit supporting your GPU (`12.8+` for Blackwell), C++17, `make`, Python 3 for SVG generation. No PyTorch dependency.
+Requirements: NVIDIA GPU, matching CUDA toolkit with `nvcc`, C++17, `make`. The standalone binary has no Python dependency.
 
 ```bash
-make CUDA_ARCH=sm_120
-./build/branchcraft test
+make CUDA_ARCH=sm_120                 # set the SM target for your GPU
+./build/branchcraft test             # CPU oracle and cache invariants
 ./build/branchcraft tree-bench --output benchmarks/tree_results.csv
 ./build/branchcraft bench --output benchmarks/decode_results.csv
 python3 scripts/make_charts.py benchmarks/decode_results.csv
 ```
 
-For Ampere or Ada, use a matching architecture such as `sm_80` or `sm_89`. `--quick` shortens either benchmark. On the rented Blackwell host, CUDA headers/compiler were provided by `nvidia/cuda:12.8.1-devel-ubuntu22.04`; the compiled binary ran directly on the host's NVIDIA driver. The command sequence was:
+For the framework path, install PyTorch and vLLM for your CUDA platform in a Python 3.12 environment, then build the extension against that same environment:
 
 ```bash
-docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.8.1-devel-ubuntu22.04 make CUDA_ARCH=sm_120
-./build/branchcraft test
-./build/branchcraft tree-bench
-./build/branchcraft bench
-python3 scripts/make_charts.py benchmarks/decode_results.csv
+pip install vllm==0.27.0 pytest
+CUDA_HOME=/path/to/cuda TORCH_CUDA_ARCH_LIST=12.0 \
+  pip install -e . --no-build-isolation --no-deps
+pytest -q tests/test_torch_ops.py tests/test_transaction.py tests/test_vllm_backend.py
+python examples/vllm_parity.py --output benchmarks/vllm_parity.json
 ```
 
-## Kernel and cache model
+The parity script launches stock vLLM Triton and Branchcraft `CUSTOM` in separate processes, compares exact greedy token IDs, and requires trace markers for both the custom decode and Triton prefill fallback. The [checked-in model parity artifact](benchmarks/vllm_parity.json) records three prompts, both sets of token IDs, the model revision, and framework versions. See the [environment, backend guard, and source map](docs/framework-integration.md). `BRANCHCRAFT_TRACE=1` enables the route markers.
 
-```mermaid
-flowchart LR
-  P[Shared paged prefix] --> V[Tree verification kernel]
-  T[Draft Q/K/V + parent pointers] --> V
-  V --> O[Output for every tree node]
-  O --> A[Accepted path chosen by caller]
-  A --> C[Copy partial page + commit K/V]
-  C --> D[Updated page table and lengths]
-  D --> R[Ordinary paged GQA decode]
-```
+## What the CUDA verifier measures
 
-The verifier maps one warp to one `(request, node, query head)`. It reads FP16 K/V, accumulates QK and softmax state in FP32, and walks parent indices from the node to the root. The prefix is stored once in a shuffled physical page pool. Draft nodes are stored once each. A separate paged GQA decode kernel supports a single-partition or split-KV path; its [dispatch sweep](assets/phase-map.svg) is a secondary study of low-batch parallelism.
+Seven candidate nodes per request, 32 query heads, 8 KV heads, D=128, FP16 KV, page size 16, RTX PRO 5000 Blackwell. Both compared paths use one batched GPU launch. The expanded baseline physically duplicates each candidate's prefix and runs this repository's paged decode kernel. The ratio is `expanded / tree`; below 1 means the tree path is slower.
 
-The test suite checks empty prefixes, partial pages, two head dimensions, ragged ordinary decode, 1–16 KV splits, tree ancestor masking, accepted-path equality, sibling isolation, and metadata rollback. See [benchmark protocol](benchmarks/README.md) for exact timing and memory definitions.
+| Requests | Prefix tokens | Tree latency | Expanded latency | Ratio | Live KV saved |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2,048 | 714.1 µs | 675.9 µs | 0.95× | 85.8% |
+| 4 | 1,024 | 338.9 µs | 543.4 µs | 1.60× | 96.4% |
+| 8 | 2,048 | 725.2 µs | 1,121.4 µs | 1.55× | 98.2% |
 
-## Scope and limitations
+![Tree attention latency against the expanded representation](assets/tree-latency.svg)
 
-Branchcraft covers the **attention and KV-cache boundary**, not a full model forward pass. It has no draft model, token sampler, acceptance algorithm, prefill, continuous scheduler, or framework integration. The host test demonstrates a single transaction and reserves physical pages up front; it is not a concurrent production allocator. The tree kernel is a legible one-warp-per-head implementation and does not use tensor cores or the advanced partitioning of DeFT or FlashInfer. CPU-side metadata validation is required before passing parent pointers and page IDs to the CUDA kernels.
+The memory metric counts live KV representation, excluding reserve capacity and allocator metadata. These are **within-project** measurements, not speedups against vLLM or vendor attention kernels. The single-request long-prefix regression is a real limitation. See [raw CSV](benchmarks/tree_results.csv) and the [benchmark protocol](benchmarks/README.md).
 
-## Repository map
+![Live KV memory with shared and expanded prefixes](assets/tree-memory.svg)
 
-| Path | What to inspect |
-| --- | --- |
-| [`src/tree_attention.cu`](src/tree_attention.cu) | Ancestor-only online softmax and accepted-path copy |
-| [`src/paged_gqa.cu`](src/paged_gqa.cu) | Paged GQA decode, split-KV, stable merge |
-| [`src/main.cu`](src/main.cu) | Independent CPU oracles, shared-page transaction test, benchmarks |
-| [`include/branchcraft.hpp`](include/branchcraft.hpp) | Device-pointer contracts and supported shapes |
-| [`benchmarks/tree_results.csv`](benchmarks/tree_results.csv) | Raw tree versus expanded-cache measurements |
-| [`benchmarks/decode_results.csv`](benchmarks/decode_results.csv) | Split-KV dispatch sweep |
-| [`scripts/make_charts.py`](scripts/make_charts.py) | Rebuilds every chart from raw CSV with Python standard library |
-| [`docs/index.html`](docs/index.html) | Illustrated, interactive engineering article |
+The ordinary decode kernel also has split-KV execution and an FP32 merge of partial softmax states. Its [dispatch sweep](assets/phase-map.svg) studies low-batch, long-context parallelism; it is not used by the vLLM packed-cache fast path.
 
-MIT licensed. See [LICENSE](LICENSE).
+## Correctness gates
+
+- The standalone CUDA suite compares outputs with an independent CPU oracle and checks empty/partial pages, ragged batches, two head dimensions, split-KV, tree masks, accepted-path replay, sibling isolation, and rollback.
+- The PyTorch tests compare tree and packed-cache outputs with independent tensor references; they exercise HND and NHD strides, dispatcher schema/FakeTensor behavior, compilation tracing, CUDA graph replay, and in-place commit.
+- The transaction test forks a request, commits into a shared partial page, checks the sibling bytes, then rolls back the request to the original mapping and bytes.
+- The model script checks that a real vLLM generation enters the custom CUDA decode path and emits the same greedy token IDs as stock Triton.
+
+## Scope and prior work
+
+Tree attention and paged KV are established ideas. [SpecInfer](https://arxiv.org/abs/2305.09781), [DeFT](https://arxiv.org/abs/2404.00242), [PagedAttention](https://arxiv.org/abs/2309.06180), and [FlashInfer](https://arxiv.org/abs/2501.01005) inform this project. Branchcraft contributes a compact implementation of the **tree verification ↔ page transaction ↔ framework operator** boundary and a separate vLLM V1 decode backend that reads its packed cache directly.
+
+The tree kernel is one warp per output head; it does not use tensor cores or production-scale prefix partitioning. The Python page owner is an inspectable test and example, not a concurrent allocator. The vLLM fast path covers causal FP16 one-token decode with page size 16 and D=64/128; other cases use vLLM's inherited Triton implementation. vLLM internal metadata is version-sensitive, so the integration pins `vllm==0.27.0`.
+
+MIT licensed. See [LICENSE](LICENSE) and [CONTRIBUTING.md](CONTRIBUTING.md).

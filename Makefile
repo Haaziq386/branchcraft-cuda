@@ -5,9 +5,9 @@ NVCCFLAGS ?= -O3 -std=c++17 -lineinfo
 .PHONY: all test bench clean
 all: build/branchcraft
 
-build/branchcraft: src/main.cu src/paged_gqa.cu src/tree_attention.cu include/branchcraft.hpp
+build/branchcraft: src/main.cu src/paged_gqa.cu src/tree_attention.cu src/packed_decode.cu include/branchcraft.hpp
 	mkdir -p build
-	$(NVCC) $(NVCCFLAGS) -arch=$(CUDA_ARCH) -Iinclude src/main.cu src/paged_gqa.cu src/tree_attention.cu -o $@
+	$(NVCC) $(NVCCFLAGS) -arch=$(CUDA_ARCH) -Iinclude src/main.cu src/paged_gqa.cu src/tree_attention.cu src/packed_decode.cu -o $@
 
 test: build/branchcraft
 	./build/branchcraft test

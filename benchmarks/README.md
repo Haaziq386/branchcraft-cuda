@@ -19,3 +19,17 @@ This secondary sweep uses ragged request lengths, shuffled physical pages, 32 qu
 Every timed path gets five warmup launches. Seven trials then run twenty back-to-back launches each. CUDA events bracket each trial; the CSV reports the median per-launch time across trials. This reduces host launch jitter but does not lock clocks or eliminate contention. Data generation is deterministic, with the fixture seed recorded in `src/main.cu`. The Python chart generator reads the CSV without hand-edited numbers.
 
 Run `./build/branchcraft tree-bench --quick` and `./build/branchcraft bench --quick` for a fast smoke test. Rebuilding the full checked-in results takes longer and may produce different values on another device or driver.
+
+## Model-level backend parity (`vllm_parity.json`)
+
+This is a correctness artifact, not a latency benchmark. On the same RTX PRO
+5000 Blackwell, Python 3.12, PyTorch 2.13.0, and vLLM 0.27.0, the script ran
+three prompts with greedy sampling for up to 24 new tokens using both
+`TRITON_ATTN` and Branchcraft's `CUSTOM` attention backend. The model is
+`Qwen/Qwen3-0.6B` at revision
+`c1899de289a04d12100db370d81485cdf75e47ca`. The script required exact
+token-ID parity, an observed `packed_decode_out` fast-path marker, and an
+observed Triton prefill fallback marker; all checks passed. The JSON records
+the prompts and complete generated token IDs
+for each backend. Reproduce it with
+`python examples/vllm_parity.py --output benchmarks/vllm_parity.json`.
