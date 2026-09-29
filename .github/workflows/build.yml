@@ -1,0 +1,33 @@
+name: CUDA compile and artifact checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cuda-build:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile SM 120 CUDA binary
+        run: make CUDA_ARCH=sm_120
+  artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild benchmark figures from checked-in data
+        run: |
+          python3 scripts/make_charts.py benchmarks/decode_results.csv
+          git diff --exit-code -- assets
+      - name: Verify HTML and SVG syntax
+        run: |
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from xml.etree import ElementTree
+          HTMLParser().feed(Path('docs/index.html').read_text(encoding='utf-8'))
+          for path in Path('assets').glob('*.svg'):
+              ElementTree.parse(path)
+          print('HTML and SVG parse checks passed')
+          PY
